@@ -12,7 +12,14 @@
    - [AF-02: Suspected Prompt Injection in Agent Pipeline](#af-02-suspected-prompt-injection-in-agent-pipeline)
    - [AF-03: Agent-Generated Artifact of Unknown Provenance in Production](#af-03-agent-generated-artifact-of-unknown-provenance-in-production)
    - [AF-04: Agent Escalated Its Own Permissions](#af-04-agent-escalated-its-own-permissions)
+   - [AF-05: Multi-Agent Cascade Compromise](#af-05-multi-agent-cascade-compromise)
+   - [AF-06: Model Supply Chain Tampering Detected Post-Deployment](#af-06-model-supply-chain-tampering-detected-post-deployment)
 7. [Forensic Readiness for Agent Systems](#forensic-readiness-for-agent-systems)
+8. [Multi-Agent Forensics](#multi-agent-forensics)
+9. [Agent Forensics Metrics](#agent-forensics-metrics)
+10. [SIEM Integration for Agent Audit Events](#siem-integration)
+11. [Regulatory and Compliance Context](#regulatory-and-compliance-context)
+12. [Investigation Report Template](#investigation-report-template)
 
 ---
 
@@ -714,6 +721,97 @@ jq --arg time "${POLICY_CHANGE_TIME}" --arg pv "${MODIFIED_POLICY_VERSION}" \
 
 ---
 
+### AF-05: Multi-Agent Cascade Compromise
+
+**Indicators**:
+- Two or more agent sessions show anomalous behavior with a temporal correlation
+- An agent that receives task input from another agent exhibits behavior inconsistent with the originating human task
+- Tool call logs show Agent B invoking high-risk tools that are inconsistent with the task delegated to it by Agent A
+- An agent's `task_source` field in the session initiation event references another agent's `session_id`
+
+**Investigation Steps**:
+
+```bash
+# 1. Map the agent delegation chain - find all sessions where task_source references another session
+jq '[.[] | select(.event_type == "session_start") |
+  select(.task_source | startswith("agent_session:")) |
+  {session_id, agent_id, task_source, authorized_by, timestamp}]' \
+  agent-session-events.json | sort_by(.timestamp)
+
+# 2. Build the full delegation tree from origin session to leaf sessions
+# Use the incident session as starting point and trace downstream
+ORIGIN_SESSION="sess-a1b2..."
+
+# Find all sessions that were delegated from the origin
+jq --arg orig "${ORIGIN_SESSION}" \
+  '[.[] | select(.task_source == ("agent_session:" + $orig))]' \
+  agent-session-events.json
+
+# 3. For each agent in the chain, retrieve its tool calls and compare against its authorization scope
+# Repeat for each session in the chain
+
+# 4. Identify where in the delegation chain the anomalous task was introduced
+# Compare the original human-authorized task against what each agent actually did
+```
+
+**Root Cause Questions**: Was the injection in the original task, or did it enter via an intermediate agent's context? Which agent first exhibited the anomalous behavior? Did any agent in the chain have broader permissions than the human principal?
+
+**Containment**: Suspend ALL agents in the delegation chain, not only the leaf agent. Revert all actions taken by all agents in the chain after the injection point.
+
+---
+
+### AF-06: Model Supply Chain Tampering Detected Post-Deployment
+
+**Indicators**:
+- Behavior of an AI component in production deviates from expected baseline after a model version update
+- A model loaded from a registry or model hub does not match its expected hash
+- modelscan or similar tool detects suspicious serialization artifacts in a deployed model
+- A model produces outputs that are unexpectedly consistent with a specific adversarial pattern (backdoor trigger)
+
+**Investigation Steps**:
+
+```bash
+# 1. Verify the deployed model's hash against what was signed at build time
+MODEL_PATH="/opt/models/devsecops-triage-v2.pkl"
+DEPLOYED_HASH=$(sha256sum ${MODEL_PATH} | cut -d' ' -f1)
+
+# Compare against the artifact attestation
+cosign download attestation \
+  --type https://in-toto.io/Statement/v0.1 \
+  registry.internal/models/devsecops-triage:v2 \
+  | jq -r '.payload | @base64d | fromjson | .predicate.buildConfig.modelHash'
+
+# 2. Check when the model was last updated and by what process
+# Query the model registry audit log
+aws s3api list-object-versions \
+  --bucket model-registry-prod \
+  --prefix models/devsecops-triage-v2 \
+  | jq '.Versions[] | {version: .VersionId, modified: .LastModified, etag: .ETag}'
+
+# 3. Scan the deployed model for serialization-based attacks
+pip install modelscan
+modelscan -p ${MODEL_PATH} --output json > modelscan-results.json
+jq '.summary' modelscan-results.json
+
+# 4. Compare model behavior against the known-good baseline
+# If a canary test suite exists, run it against the deployed model
+python3 model_tests/canary_suite.py \
+  --model-path ${MODEL_PATH} \
+  --baseline-results model_tests/baseline-results.json \
+  --report modelscan-behavioral-report.json
+
+# 5. Check the pipeline that deployed this model for unauthorized modifications
+gh api /repos/${ORG}/${REPO}/actions/runs \
+  --field head_sha=$(git log --format="%H" -1 -- models/devsecops-triage-v2) \
+  | jq '.workflow_runs[] | {run_id: .id, triggered_by: .triggering_actor.login, conclusion}'
+```
+
+**Containment**: Roll back to the previous model version immediately. Do not attempt to "fix" the model — any fine-tuned or retrained model may retain the tampering. Treat the model file as a compromised artifact and follow chain of custody procedures for artifact evidence.
+
+**Root Cause**: Determine whether tampering occurred in the training pipeline, in the model registry, or in the deployment process. Audit all access to the model artifact from training completion to deployment.
+
+---
+
 ## Forensic Readiness for Agent Systems
 
 The following checklist defines the minimum infrastructure that must be deployed before an agent incident can be investigated effectively. All items are prerequisites for using the AF-01 through AF-04 playbooks.
@@ -777,3 +875,300 @@ roles:
     scope_constraints:
       may_not_approve_without_human_review: true
 ```
+
+---
+
+## Multi-Agent Forensics
+
+Forensic investigation becomes significantly more complex when multiple agents collaborate or delegate to each other. A prompt injection in Agent A's input can propagate to Agent B if Agent A delegates tasks to Agent B, and Agent B inherits the compromised instruction without ever seeing the original malicious input.
+
+### The Delegation Chain Problem
+
+In a multi-agent system, the path from a human-authorized task to a terminal action may pass through several agent handoffs:
+
+```
+Human Principal → Agent A (orchestrator) → Agent B (code reviewer) → Agent C (deployer)
+```
+
+Each handoff is a potential injection point. An attacker who can influence Agent A's task description can potentially cause Agent C to deploy a malicious artifact without Agent C ever receiving direct adversarial input.
+
+The following diagram illustrates a typical multi-agent delegation topology with injection point markers:
+
+```
+Human Principal
+      │
+      │  (authorized task)
+      ▼
+Orchestrator Agent  ◄── [INJECTION POINT 1: task input / initial context]
+      │
+      ├──────────────────────────┐
+      │                          │
+      ▼                          ▼
+Code Review Agent          Security Scan Agent
+◄── [INJECTION POINT 2:    ◄── [INJECTION POINT 3:
+     PR description /            SBOM content /
+     code comment]               dependency metadata]
+      │                          │
+      └──────────┬───────────────┘
+                 │  (combined review result)
+                 ▼
+           Deploy Agent  ◄── [INJECTION POINT 4: combined context
+                               passed by orchestrator]
+                 │
+                 ▼
+         Production System
+```
+
+A compromised instruction introduced at Injection Point 1 may reach the Deploy Agent without any of the intermediate agents recognizing the instruction as adversarial.
+
+### Evidence Requirements for Multi-Agent Investigations
+
+For each agent in a delegation chain, the investigation requires:
+
+| Evidence Item | Where to Find It | Why It Matters |
+|---|---|---|
+| Session initiation event with `task_source` | agent-session-events.json | Establishes the delegation parent |
+| Tool calls for this session | tool-call-log.json filtered by session_id | Establishes what this specific agent did |
+| The input the orchestrator sent to this agent | agent-to-agent communication log or tool call output of the delegation tool | Establishes whether the injected instruction was present when this agent received its task |
+| The authorization scope of this agent | policies/agent-tool-authorization.yaml at the policy version in effect | Establishes whether this agent's permissions were appropriate for its position in the chain |
+
+### Shared Identity vs. Per-Agent Identity
+
+Multi-agent systems may use a shared identity (all agents run under the same service account) or per-agent identities. The forensic implications differ:
+
+- **Shared identity**: All tool calls appear to come from the same principal. The `agent_id` and `session_id` fields in the tool call log are the only way to distinguish which agent took which action.
+- **Per-agent identity**: Each agent's actions are distinguishable in IAM and audit logs. Blast radius containment is simpler — revoke the compromised agent's identity without affecting others.
+
+**Recommendation**: Production agent systems must use per-agent, per-session OIDC identities. A shared agent identity is a forensic dead end.
+
+---
+
+## Agent Forensics Metrics
+
+The following KPIs measure the effectiveness of the agent forensics program. These metrics should be tracked continuously and reviewed at each post-incident retrospective.
+
+| Metric | Definition | Target | Source |
+|---|---|---|---|
+| Mean Time to Detect Agent Incident (MTTD-AI) | Time from agent action to detection of unauthorized behavior | < 15 minutes for P1, < 2 hours for P2 | SIEM alert latency + tool call log analysis |
+| Mean Time to Contain Agent Incident (MTTC-AI) | Time from detection to agent suspension | < 30 minutes | Incident response timeline |
+| Tool Call Log Coverage | Percentage of agent tool calls that appear in the immutable log within 60 seconds | > 99.9% | Log completeness audit |
+| External Content Source Coverage | Percentage of external data sources accessed by agents that have content hash logging | 100% | Configuration audit |
+| Policy Version Traceability | Percentage of tool call log entries with a valid, resolvable `authorization_policy_version` | 100% | Log quality check |
+| Forensic Readiness Score | Current Forensics Readiness Score level (1–5) for the agent forensics domain | Level 3 minimum before production agents | Self-assessment |
+| Agent Incident Recurrence Rate | Number of incidents caused by the same root cause (policy gap, injection vector) in 90-day window | 0 recurrences | Post-incident tracking |
+
+### Instrumenting Metrics in a SIEM
+
+**Log source configuration** (applies to all SIEM platforms):
+- All agent tool call logs must be ingested as a dedicated log source type (`agent-tool-calls`), not mixed with application logs.
+- Each log entry must preserve the `session_id`, `agent_id`, `tool_name`, `authorization_decision`, `system_prompt_hash`, and `timestamp` fields as indexed, searchable fields — not buried in a raw message string.
+- Log ingestion latency (time from tool call to SIEM availability) must be monitored as a separate metric. Ingestion latency above 60 seconds disables real-time detection.
+
+**Detection rules for MTTD-AI measurement**:
+
+Configure a SIEM alert with the following trigger logic to serve as the MTTD-AI clock start:
+
+```
+event_type = "tool_call"
+AND (
+  authorization_decision = "DENY"
+  OR tool_name NOT IN (authorized_tools_for_agent_role)
+  OR (content_source IN (external_sources) AND tool_name IN (high_risk_tools))
+)
+```
+
+Record the alert timestamp as T0. The incident commander records the agent suspension timestamp as T1. MTTC-AI = T1 - T0.
+
+**Tool call log coverage measurement**:
+
+```bash
+# Sample-based coverage check: compare tool call events in the agent application log
+# against entries in the immutable SIEM log for the same time window
+START="2024-01-15T14:00:00Z"
+END="2024-01-15T15:00:00Z"
+
+APP_LOG_COUNT=$(jq '[.[] | select(.timestamp >= "${START}" and .timestamp <= "${END}")] | length' \
+  /var/log/agent/tool-calls-raw.json)
+
+SIEM_COUNT=$(aws logs filter-log-events \
+  --log-group-name /agent/tool-calls \
+  --start-time $(date -d "${START}" +%s000) \
+  --end-time $(date -d "${END}" +%s000) \
+  --query 'length(events)' --output text)
+
+echo "App log: ${APP_LOG_COUNT} | SIEM: ${SIEM_COUNT}"
+echo "Coverage: $(echo "scale=4; ${SIEM_COUNT} / ${APP_LOG_COUNT} * 100" | bc)%"
+```
+
+---
+
+## SIEM Integration for Agent Audit Events
+
+Agent tool call logs must be integrated into the organization's SIEM for real-time detection. This section provides integration guidance for common SIEM platforms.
+
+### Splunk Integration
+
+```
+# sourcetype definition for agent tool call logs (inputs.conf / transforms.conf)
+[agent-tool-calls]
+SHOULD_LINEMERGE = false
+LINE_BREAKER = ([\r\n]+){
+MAX_EVENTS = 1
+KV_MODE = json
+
+# Detection search: agent invoked tool outside authorization scope
+index=agent_audit sourcetype=agent-tool-calls
+| eval is_unauthorized = case(
+    authorization_decision == "DENY", "true",
+    NOT match(tool_name, allowed_tools_pattern), "true",
+    true(), "false"
+  )
+| where is_unauthorized == "true"
+| table _time, session_id, agent_id, tool_name, authorization_decision, system_prompt_hash
+| sort -_time
+```
+
+### AWS OpenSearch / CloudWatch Insights
+
+```
+# CloudWatch Logs Insights query for unauthorized agent tool calls
+fields @timestamp, session_id, agent_id, tool_name, authorization_decision
+| filter authorization_decision = "DENY"
+| sort @timestamp desc
+| limit 100
+
+# Detection rule for high-frequency tool calls (potential agent loop or exfiltration)
+fields @timestamp, session_id, agent_id, tool_name
+| stats count(*) as call_count by session_id, tool_name
+| filter call_count > 20
+| sort call_count desc
+```
+
+### Detection Rules for Common Agent Attack Patterns
+
+| Attack Pattern | Detection Logic | Severity |
+|---|---|---|
+| Unauthorized tool call | `authorization_decision == DENY` | High |
+| Tool outside authorization scope | `tool_name NOT IN allowed_tools_for_agent_role` | High |
+| High-frequency tool calls | `count(tool_calls) > threshold within 5 min window` | Medium |
+| External content ingestion followed by anomalous tool | sequence: `content_source IN external_sources` THEN `tool_name IN high_risk_tools` within 3 turns | Critical |
+| Agent modifying its own policy or system prompt | `tool_name IN write_tools AND tool_input.file_path matches policy_or_prompt_pattern` | Critical |
+| Agent session with no human authorization | `session_start.authorized_by` is null or empty | High |
+
+---
+
+## Regulatory and Compliance Context
+
+### EU AI Act (2024)
+
+The EU AI Act classifies AI systems used in critical infrastructure and employment decision-making as high-risk, requiring:
+- Logging of AI system operations sufficient for post-hoc review (Article 12)
+- Human oversight mechanisms (Article 14)
+- Technical robustness and accuracy requirements (Article 15)
+
+For DevSecOps organizations operating in the EU or deploying AI agents in contexts covered by the Act, the agent audit trail specification in this framework satisfies Article 12 logging requirements when deployed with immutable storage. The tool authorization policy and approval gate requirements in `ai-devsecops-framework/docs/agent-authorization.md` satisfy Article 14 human oversight requirements.
+
+### NIST AI Risk Management Framework (AI RMF)
+
+The NIST AI RMF GOVERN, MAP, MEASURE, and MANAGE functions map to agent forensics as follows:
+
+| AI RMF Function | Agent Forensics Capability |
+|---|---|
+| GOVERN 1.4 (organizational teams understand roles) | Agent forensics readiness checklist; defined domain lead role |
+| MAP 1.5 (risk context established) | Five Forensic Questions; threat taxonomy |
+| MEASURE 2.5 (AI system performance monitored) | Agent forensics metrics; MTTD-AI, tool call log coverage |
+| MANAGE 2.2 (incident response procedures) | AF-01 through AF-06 playbooks |
+
+### SOC 2 Type II
+
+Agent activity logs satisfy SOC 2 CC7.2 (monitoring of system performance), CC7.3 (evaluation of security events), and CC7.4 (incident response) when:
+- Tool call logs are immutable and retained for at least 12 months
+- Session initiation events include `authorized_by` for accountability
+- Playbook execution is documented with timestamps and outcomes
+
+---
+
+## Investigation Report Template
+
+The following template produces the minimum required evidence package for regulatory compliance and organizational learning. Complete this template for every agent forensics investigation before closing the incident.
+
+````markdown
+# Agent Forensics Investigation Report
+
+**Report ID**: [AF-IR-YYYYMMDD-NNN]
+**Incident Date**: [date of first indicator]
+**Report Date**: [date of report]
+**Lead Investigator**: [name and role]
+**Classification**: [Internal / Restricted / Confidential]
+
+---
+
+## 1. Executive Summary
+
+[2-3 sentences: what happened, what the agent did, what the impact was, current status]
+
+## 2. Incident Timeline
+
+| Timestamp | Event | Source |
+|---|---|---|
+| [T+0] | First indicator observed | [log source] |
+| [T+N] | Agent session identified | tool-call-log.json |
+| [T+N] | Containment action taken | incident-timeline.md |
+
+## 3. Agent System Description
+
+- **Agent ID**: [agent_id from tool call log]
+- **Agent Role**: [authorized role per tool authorization policy]
+- **System Prompt Version**: [sha256 hash and git tag]
+- **Tool Authorization Policy Version**: [version tag]
+- **Model ID**: [model version used in the session]
+- **Session ID**: [session_id]
+
+## 4. Five Forensic Questions — Findings
+
+**Q1: Was the agent acting within its authorized scope?**
+[Authorized tools] / [Actual tool calls] / [Scope violations identified]
+
+**Q2: Was the agent's context manipulated?**
+[External content sources accessed] / [Injection indicators found Y/N] / [Injection source if identified]
+
+**Q3: What did the agent actually do?**
+[Chronological list of tool calls and their effects]
+
+**Q4: Are the agent's outputs authentic and unmodified?**
+[Cosign verification result] / [Tool call log cross-reference result]
+
+**Q5: What downstream effects did the agent's actions produce?**
+[Blast radius: services affected, artifacts deployed, data accessed]
+
+## 5. Root Cause
+
+[The specific vulnerability, misconfiguration, or process failure that enabled the incident]
+
+## 6. Containment and Recovery Actions
+
+[Actions taken, timestamps, verification steps]
+
+## 7. Control Effectiveness Assessment
+
+| Control | Was it in place? | Did it help? | Gap |
+|---|---|---|---|
+| Immutable tool call log | Y/N | Y/N | [gap description] |
+| Tool authorization policy | Y/N | Y/N | [gap description] |
+| Human approval gate | Y/N | Y/N | [gap description] |
+| External content hash logging | Y/N | Y/N | [gap description] |
+
+## 8. Action Items
+
+| Action | Owner | Due Date | Priority |
+|---|---|---|---|
+| [specific remediation] | [team/person] | [date] | Critical/High/Medium |
+
+## 9. Evidence Inventory
+
+| Evidence Item | Location | Hash | Retention |
+|---|---|---|---|
+| Tool call log excerpt | s3://forensics/[path] | sha256:[hash] | [date] |
+| Session conversation | s3://forensics/[path] (restricted) | sha256:[hash] | [date] |
+| External content snapshots | s3://forensics/[path] | sha256:[hash] | [date] |
+````

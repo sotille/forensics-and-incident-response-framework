@@ -150,6 +150,12 @@ Licensed under the Apache License, Version 2.0. See [LICENSE](LICENSE) for the f
 
 ## Learning Resources
 
-- **[techstream-learn/book-3-cloud-security](../techstream-learn/)** — Cloud security engineering fundamentals, including logging architecture and evidence collection
-- **[techstream-books/VOLUMES.md](../techstream-books/VOLUMES.md)** — Full index of Techstream technical volumes
+- **[techstream-learn/book-3-cloud-security](../techstream-learn/book-3-cloud-security/)** — Cloud security engineering fundamentals: logging architecture, evidence collection, and cloud-native forensics labs
+- **[techstream-learn/book-5-ai-agentic-security](../techstream-learn/book-5-ai-agentic-security/)** — AI and agentic systems security companion labs, including:
+  - [Ch 14 — The Agent Forensics Problem](../techstream-learn/book-5-ai-agentic-security/ch14-forensics-problem/) — Evidence gap analysis for uninstrumented agent deployments
+  - [Ch 15 — The Five Forensic Questions Framework](../techstream-learn/book-5-ai-agentic-security/ch15-five-forensic-questions/) — Structured investigation using the Five Questions against simulated incident evidence
+  - [Ch 16 — Agent Forensics Investigation Playbooks](../techstream-learn/book-5-ai-agentic-security/ch16-forensics-playbooks/) — Executing AF-01 and AF-02 playbooks on realistic evidence sets
+  - [Ch 17 — Agent Forensics Readiness](../techstream-learn/book-5-ai-agentic-security/ch17-forensics-readiness/) — Forensic readiness assessment and tabletop exercise design
+  - [Ch 04 — Agent Forensics: Session Reconstruction](../techstream-learn/book-5-ai-agentic-security/ch04-agent-forensics/) — Reconstruct sessions, detect injection, verify provenance (Lab 04)
+- **[techstream-books/VOLUMES.md](../techstream-books/VOLUMES.md)** — Full index of Techstream technical volumes; this framework is a primary source for Volume 3 (Cloud-Native Security) and Volume 5 (AI and Agentic Systems Security)
 - **[www.techstream.app](https://www.techstream.app)** — Techstream platform and additional resources

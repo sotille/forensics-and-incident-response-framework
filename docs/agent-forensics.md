@@ -1088,6 +1088,22 @@ Agent activity logs satisfy SOC 2 CC7.2 (monitoring of system performance), CC7.
 
 ---
 
+## Related Framework Documentation
+
+This document covers agent forensics investigation procedures. The following companion documents in the Techstream ecosystem address the preventive and operational aspects that forensic readiness depends on:
+
+| Document | Relevance to Agent Forensics |
+|---|---|
+| [ai-devsecops-framework/docs/production-operations.md](../../ai-devsecops-framework/docs/production-operations.md) | Defines progressive autonomy levels, blast radius limits, and the AI Operations Governance Board model. The production incident response procedure in that document references this framework's Five Forensic Questions for the investigation phase. |
+| [ai-devsecops-framework/docs/agent-authorization.md](../../ai-devsecops-framework/docs/agent-authorization.md) | Defines the tool authorization policy schema that Q5 (authorization basis) relies on for classification of agent actions. Authorization policy must be version-controlled for Q5 to be answerable. |
+| [ai-devsecops-framework/docs/agent-audit-trail.md](../../ai-devsecops-framework/docs/agent-audit-trail.md) | Specifies the minimum viable audit record that enables this document's evidence collection procedures. The audit trail spec is the pre-incident architecture that makes post-incident investigation tractable. |
+| [ai-devsecops-framework/docs/pipeline-controls.md](../../ai-devsecops-framework/docs/pipeline-controls.md) | Circuit breaker and approval gate patterns that generate the authorization decision records used in AF-01 and AF-04 investigations. |
+| [secure-ci-cd-reference-architecture/docs/pipeline-forensics-playbook.md](../../secure-ci-cd-reference-architecture/docs/pipeline-forensics-playbook.md) | Pipeline forensics for non-agent CI/CD incidents; the foundational playbook extended by this document's agent-specific procedures (PL-07, PL-08). |
+
+**Learning resources:** The hands-on labs for this framework are in [techstream-learn/book-5-ai-agentic-security/](../../techstream-learn/book-5-ai-agentic-security/), specifically chapters 14–17 which cover the agent forensics problem, Five Forensic Questions framework, investigation playbooks, and forensic readiness assessment.
+
+---
+
 ## Investigation Report Template
 
 The following template produces the minimum required evidence package for regulatory compliance and organizational learning. Complete this template for every agent forensics investigation before closing the incident.
